@@ -1,0 +1,9 @@
+cache/
+.DS_Store
+eval/data
+__pycache__
+*.log
+eval/Coding/livecodebench/LiveCodeBench-main/assets
+eval/eval_results
+benchmark_evaluation_v2
+benchmark_evaluation_v2.tar.gz
