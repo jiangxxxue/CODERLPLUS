@@ -8,7 +8,7 @@ project_name="CodeRL+"
 experiment_name="[define your experiment name here]"
 
 train_file=data/train_set.parquet
-val_files=data/test_set.parquet
+val_files=data/validation_set.parquet
 
 LOG_DIR="logs/$project_name"
 mkdir -p "$LOG_DIR"
