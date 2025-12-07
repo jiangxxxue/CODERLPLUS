@@ -24,7 +24,7 @@ To evaluate the trained model, use:
 bash benchmark_evaluation/eval/run.sh
 ```
 
-For detailed evaluation instructions, please refer to the [evaluation guide](CODERLPLUS/benchmark_evaluation/eval/README.md).
+For detailed evaluation instructions, please refer to the [evaluation guide](benchmark_evaluation/README.md).
 
 ## 📝 Citation
 
