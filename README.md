@@ -8,8 +8,24 @@ The CODERL+ trained models are available for download [here](https://huggingface
 
 If you want to train your own model, follow these steps:
 
-### 1. Download Training Data
+### 1. Download Training Data and prepare environment
 Download the training dataset [here](https://huggingface.co/datasets/xueniki/data_CodeRLPLUS/tree/main). The training data is derived from the [PRIME](https://arxiv.org/abs/2502.01456) work, with adjusted instructions for code RL training.
+
+```bash
+bash recipe/prepare_data.sh
+```
+
+Launch docker container as the execution environment.
+
+```bash
+bash run.sh
+```
+
+Go to `/workspace/verl`
+
+```bash
+pip3 install --no-deps -e .
+```
 
 ### 2. Run Training Script
 Execute the training script with the following command:

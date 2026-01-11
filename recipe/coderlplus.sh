@@ -3,9 +3,9 @@
 # IMPORTANT: See and modify  all [] placeholders in this file.
 # Requires 8 GPUs with 80GB memory.
 
-model_path="LLMs/Qwen2.5-Coder-7B-Instruct"
+model_path="Qwen/Qwen2.5-Coder-7B-Instruct"
 project_name="CodeRL+"
-experiment_name="[define your experiment name here]"
+experiment_name="test"
 
 train_file=data/train_set.parquet
 val_files=data/validation_set.parquet
