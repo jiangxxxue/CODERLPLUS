@@ -11,10 +11,6 @@ If you want to train your own model, follow these steps:
 ### 1. Download Training Data and prepare environment
 Download the training dataset [here](https://huggingface.co/datasets/xueniki/data_CodeRLPLUS/tree/main). The training data is derived from the [PRIME](https://arxiv.org/abs/2502.01456) work, with adjusted instructions for code RL training.
 
-```bash
-bash recipe/prepare_data.sh
-```
-
 Launch docker container as the execution environment.
 
 ```bash
@@ -25,6 +21,11 @@ Go to `/workspace/verl`
 
 ```bash
 pip3 install --no-deps -e .
+```
+
+Run following script to preare dataset and install necessary packages
+```bash
+bash recipe/prepare_data.sh
 ```
 
 ### 2. Run Training Script
