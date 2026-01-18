@@ -21,6 +21,7 @@ Go to `/workspace/verl`
 
 ```bash
 pip3 install --no-deps -e .
+pip3 install anthropic math_verify loky
 ```
 
 Run following script to preare dataset and install necessary packages

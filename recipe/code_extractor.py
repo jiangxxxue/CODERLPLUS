@@ -5,24 +5,31 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import time
 from typing import Any, Dict, List, Tuple
+from concurrent.futures import as_completed
 
 import numpy as np
 import ray
+from tqdm import tqdm
 
 from verl import DataProto
 
 from .rollout_buffer import get_global_rollout_buffer
 from .filter import SimpleCodeFilter
 
+# Try to use loky (ProcessPoolExecutor with cloudpickle) for better pickling support
+try:
+    from loky import get_reusable_executor
+    LOKY_AVAILABLE = True
+except ImportError:
+    from concurrent.futures import ProcessPoolExecutor
+    LOKY_AVAILABLE = False
+    print("Warning: loky not available for code_extractor. Install with: pip install loky")
+    print("Falling back to standard ProcessPoolExecutor")
+
 MAX_TEST_CASES = 1
 
-
-import tempfile
-import subprocess
-import sys
-import os
-import json
 
 class CodeExecutor:
     _CAPTURE_TEMPLATE = '''
@@ -246,12 +253,95 @@ def check_exec_semantics_align_task_length(task_record: Dict[str, Any], tokenize
     Check if a execution semantics alignment task prompt length is within limits
     """
     messages = task_record['prompt']
-    
+
     raw_prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    
+
     token_length = len(tokenizer.encode(raw_prompt, add_special_tokens=False))
-    
+
     return token_length <= max_prompt_length
+
+
+def _process_single_response(i, data_source, response, reward, reward_model_data,
+                             global_steps, min_complexity, max_complexity):
+    """
+    Worker function to process a single response in parallel.
+    Returns: (task_records, stats_dict)
+    """
+    stats = {
+        'total_candidates': 0,
+        'filtered_by_correct_reward': 0,
+        'filtered_by_complexity': 0,
+        'filtered_by_execution_error': 0,
+        'actual_output_is_none': 0,
+        'processed': 0
+    }
+
+    task_records = []
+
+    if "exec_semantics_align" in data_source or "code_execution" in data_source:
+        return task_records, stats
+
+    code_blocks = extract_python_code(response)
+    if not code_blocks:
+        return task_records, stats
+
+    ground_truth = parse_ground_truth(reward_model_data)
+    test_inputs = ground_truth['inputs'][:MAX_TEST_CASES]
+    expected_outputs = ground_truth['outputs'][:MAX_TEST_CASES]
+
+    if not test_inputs or not expected_outputs:
+        return task_records, stats
+
+    code = code_blocks[-1]
+    complexity = calculate_cyclomatic_complexity(code)
+
+    executor = CodeExecutor()
+
+    for test_idx, (test_input, expected_output) in enumerate(zip(test_inputs, expected_outputs)):
+        stats['total_candidates'] += 1
+
+        if complexity < min_complexity or complexity > max_complexity:
+            stats['filtered_by_complexity'] += 1
+            continue
+
+        if reward > 0:
+            stats['filtered_by_correct_reward'] += 1
+            continue
+
+        actual_output = executor.execute_code(code, test_input)
+
+        if actual_output[0].startswith("ERROR:"):
+            stats['filtered_by_execution_error'] += 1
+            continue
+
+        if actual_output[0] == '':
+            stats['actual_output_is_none'] += 1
+            continue
+
+        test_result = False
+
+        raw_record = {
+            "step": global_steps,
+            "data_source": data_source,
+            "code": code,
+            "test_input": test_input,
+            "expected_output": expected_output,
+            "actual_output": actual_output[0],
+            "local_variable": actual_output[1],
+            "test_result": test_result,
+            "test_case_index": test_idx,
+        }
+
+        try:
+            task_record = create_exec_semantics_align_task_record(raw_record)
+            task_record['_input_output_key'] = (test_input, actual_output[0])  # For deduplication in main process
+            task_records.append(task_record)
+            stats['processed'] += 1
+        except Exception as e:
+            print(f"Warning: Failed to create execution semantics alignment task from rollout record: {e}")
+            continue
+
+    return task_records, stats
 
 
 def extract_code_generation_rollout(batch: DataProto, tokenizer, global_steps: int, save_to_file: bool = False, 
@@ -285,13 +375,12 @@ def extract_code_generation_rollout(batch: DataProto, tokenizer, global_steps: i
         
         responses = batch.batch["responses"]
         response_texts = tokenizer.batch_decode(responses, skip_special_tokens=True)
-        
-        executor = CodeExecutor()
+
         exec_semantics_align_task_records = []
-        
+
         # Track seen (input, output) pairs for deduplication within this batch
         seen_input_output_pairs = set()
-        
+
         stats = {
             'total_candidates': 0,
             'filtered_by_correct_reward': 0,
@@ -302,81 +391,67 @@ def extract_code_generation_rollout(batch: DataProto, tokenizer, global_steps: i
             'actual_output_is_none': 0,
             'added_to_buffer': 0
         }
-        
-        for i, (data_source, response, reward) in enumerate(zip(data_sources, response_texts, final_rewards)):
-            if "exec_semantics_align" not in data_source and "code_execution" not in data_source:
-                code_blocks = extract_python_code(response)
-                
-                if not code_blocks:
-                    continue
 
-                ground_truth = parse_ground_truth(reward_model_data[i] if i < len(reward_model_data) else {})
-                test_inputs = ground_truth['inputs'][:MAX_TEST_CASES]
-                expected_outputs = ground_truth['outputs'][:MAX_TEST_CASES]
-                
-                if not test_inputs or not expected_outputs:
-                    continue
-                
-                code = code_blocks[-1]
-                complexity = calculate_cyclomatic_complexity(code)
-                
-                for test_idx, (test_input, expected_output) in enumerate(zip(test_inputs, expected_outputs)):
-                    stats['total_candidates'] += 1
-                    
-                    if complexity < min_complexity or complexity > max_complexity:
-                        stats['filtered_by_complexity'] += 1
-                        continue
-                    
-                    if reward > 0:
-                        # Code is correct, skip it (we only want incorrect code for reasoning tasks)
-                        stats['filtered_by_correct_reward'] += 1
-                        continue
-                    else:
-                        actual_output = executor.execute_code(code, test_input)
-                        
-                        if actual_output[0].startswith("ERROR:"):
-                            stats['filtered_by_execution_error'] += 1
+        # Process responses in parallel
+        parallel_start_time = time.time()
+
+        if LOKY_AVAILABLE:
+            executor = get_reusable_executor(max_workers=32)
+            use_context_manager = False
+        else:
+            executor = ProcessPoolExecutor(max_workers=32)
+            use_context_manager = True
+
+        try:
+            # Submit all processing tasks
+            futures = {}
+            for i, (data_source, response, reward) in enumerate(zip(data_sources, response_texts, final_rewards)):
+                reward_data = reward_model_data[i] if i < len(reward_model_data) else {}
+                future = executor.submit(
+                    _process_single_response,
+                    i, data_source, response, reward, reward_data,
+                    global_steps, min_complexity, max_complexity
+                )
+                futures[future] = i
+
+            # Collect results as they complete with progress bar
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing code responses"):
+                try:
+                    task_records, worker_stats = future.result()
+
+                    # Aggregate stats
+                    for key in worker_stats:
+                        stats[key] = stats.get(key, 0) + worker_stats[key]
+
+                    # Process task records with deduplication and prompt length checking
+                    for task_record in task_records:
+                        input_output_key = task_record.pop('_input_output_key')
+
+                        if input_output_key in seen_input_output_pairs:
+                            stats['filtered_by_duplicate'] += 1
                             continue
 
-                        if actual_output[0]=='':
-                            stats['actual_output_is_none'] += 1
-                            continue
-                                
-                        test_result = False
-                    
-                    input_output_key = (test_input, actual_output[0])
-                    if input_output_key in seen_input_output_pairs:
-                        stats['filtered_by_duplicate'] += 1
-                        continue
-                    
-                    seen_input_output_pairs.add(input_output_key)
-                    
-                    raw_record = {
-                        "step": global_steps,
-                        "data_source": data_source,
-                        "code": code,
-                        "test_input": test_input,
-                        "expected_output": expected_output,
-                        "actual_output": actual_output[0],
-                        "local_variable": actual_output[1],
-                        "test_result": test_result,
-                        "test_case_index": test_idx,
-                    }
-                    
-                    try:
-                        task_record = create_exec_semantics_align_task_record(raw_record)
-                        
+                        seen_input_output_pairs.add(input_output_key)
+
                         if filter_overlong_prompts:
                             if not check_exec_semantics_align_task_length(task_record, tokenizer, max_prompt_length):
                                 stats['filtered_by_prompt_length'] += 1
                                 continue
-                        
+
                         exec_semantics_align_task_records.append(task_record)
                         stats['added_to_buffer'] += 1
-                    except Exception as e:
-                        print(f"Warning: Failed to create execution semantics alignment task from rollout record: {e}")
-                        continue
-    
+
+                except Exception as e:
+                    print(f"Warning: Failed to process response: {e}")
+                    continue
+        finally:
+            # Clean up executor if using ProcessPoolExecutor
+            if use_context_manager:
+                executor.shutdown(wait=True)
+
+        parallel_time = time.time() - parallel_start_time
+        print(f"[DEBUG] Parallel processing completed in {parallel_time:.2f}s for {len(futures)} responses")
+
         remaining_after_complexity = stats['total_candidates'] - stats['filtered_by_complexity']
         remaining_after_correct = remaining_after_complexity - stats['filtered_by_correct_reward']
         remaining_after_execution = remaining_after_correct - stats['filtered_by_execution_error']
